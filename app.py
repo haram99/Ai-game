@@ -1,42 +1,60 @@
 # -*- coding: utf-8 -*-
 """
-لعبة "رحلة الذكاء الاصطناعي" لطالبات المرحلة الثانوية (نسخة الويب)
-التشغيل محلياً: streamlit run app.py
+رحلة الذكاء الاصطناعي — أكاديمية نمو (نسخة Streamlit)
+- تسجيل اسم الطالبة ورقم الجوال (0500000000)
+- ثلاثة مستويات: أسئلة، تدريب آلة (KNN)، اكتشاف التحيّز
+- حفظ بيانات اللاعبات ونتائجهن في ملف Excel (players.xlsx)
+- لوحة مشرف محمية بكلمة مرور لتنزيل الملف
+
+التشغيل محليًا:  streamlit run app.py
 """
-
+import hmac
 import math
-import sqlite3
-import streamlit as st
+import os
+import re
+import threading
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import altair as alt
 import pandas as pd
-import plotly.express as px
+import streamlit as st
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from PIL import Image
 
-# إعداد الصفحة
-st.set_page_config(page_title="رحلة الذكاء الاصطناعي 🤖", page_icon="🤖", layout="centered")
+BASE = Path(__file__).parent
+LOGO = BASE / "logo.jpg"
+DATA_FILE = Path(os.environ.get("PLAYERS_XLSX", BASE / "players.xlsx"))
 
-# ------------------------- إعداد قاعدة البيانات -------------------------
-def init_db():
-    conn = sqlite3.connect("ai_game_players.db")
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS players (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    phone TEXT,
-                    score INTEGER,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )''')
-    conn.commit()
-    conn.close()
+AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "0123456789" * 2)
 
-init_db()
+st.set_page_config(
+    page_title="رحلة الذكاء الاصطناعي | أكاديمية نمو",
+    page_icon=Image.open(LOGO) if LOGO.exists() else "🤖",
+    layout="centered",
+)
 
-def save_player_data(name, phone, score):
-    conn = sqlite3.connect("ai_game_players.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO players (name, phone, score) VALUES (?, ?, ?)", (name, phone, score))
-    conn.commit()
-    conn.close()
+st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&display=swap');
+.stApp, .stApp p, .stApp label, .stApp button, .stApp input, .stApp h1, .stApp h2,
+.stApp h3, .stApp h4, .stApp li, .stApp span.stMarkdown { font-family: 'Tajawal', sans-serif; }
+.stApp { direction: rtl; text-align: right; }
+[data-testid="stMarkdownContainer"], [data-testid="stCaptionContainer"],
+[data-testid="stAlert"], label, .stRadio { direction: rtl; text-align: right; }
+.block-container { max-width: 760px; padding-top: 1.5rem; }
+div.stButton > button, div[data-testid="stFormSubmitButton"] > button {
+    width: 100%; border-radius: 12px; font-weight: 700; padding: .6rem 1rem; }
+input[aria-label^="رقم الجوال"] { direction: ltr; text-align: center; letter-spacing: 2px; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-# ------------------------- بنك الأسئلة -------------------------
+# ============================== المحتوى ==============================
 LEVEL1 = [
     ("ما الذي يميّز الذكاء الاصطناعي عن البرنامج التقليدي؟",
      ["يتعلّم من البيانات ويحسّن أداءه", "يعمل بدون كهرباء", "لا يحتاج إلى بيانات أبدًا"], 0,
@@ -70,159 +88,341 @@ LEVEL3 = [
      "الإنسان مسؤول عن القرار النهائي، خاصة في الصحة والتعليم والعمل."),
 ]
 
+# (الطول, الاستدارة, الصنف الحقيقي)
 TEST_SET = [
     (4.5, 6.5, "تفاحة"), (7.5, 3.0, "موزة"), (3.0, 9.0, "تفاحة"),
     (8.5, 1.5, "موزة"), (6.0, 4.0, "موزة"), (5.0, 6.0, "تفاحة"),
 ]
+FRUIT_COLORS = ["#e03b3b", "#f2c200"]  # تفاحة، موزة
+
+LEVELS = [
+    (1, "المستوى 1: ما هو الذكاء الاصطناعي؟", "quiz1"),
+    (2, "المستوى 2: درّبي الآلة 🍎🍌", "train"),
+    (3, "المستوى 3: اكتشفي التحيّز ⚖️", "quiz3"),
+]
+
+# ============================== التخزين في Excel ==============================
+HEADERS = ["المعرّف", "تاريخ التسجيل", "الاسم", "رقم الجوال", "درجة المستوى 1",
+           "نقاط المستوى 2", "درجة المستوى 3", "مجموع النقاط", "آخر تحديث"]
+LEVEL_COL = {1: "درجة المستوى 1", 2: "نقاط المستوى 2", 3: "درجة المستوى 3"}
+
+
+@st.cache_resource
+def file_lock() -> threading.Lock:
+    """قفل مشترك بين جلسات المستخدمات حتى لا يتعارض الحفظ المتزامن."""
+    return threading.Lock()
+
+
+def _open_workbook():
+    if DATA_FILE.exists():
+        return load_workbook(DATA_FILE)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "اللاعبات"
+    ws.sheet_view.rightToLeft = True
+    ws.append(HEADERS)
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="1B6F86")
+        c.alignment = Alignment(horizontal="center")
+    for letter, w in zip("ABCDEFGHI", [14, 18, 26, 16, 16, 16, 16, 14, 18]):
+        ws.column_dimensions[letter].width = w
+    return wb
+
+
+def save_player(pid: str, fields: dict) -> None:
+    """إنشاء صف للاعبة أو تحديثه (حسب المعرّف) ثم الحفظ بشكل آمن."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with file_lock():
+        wb = _open_workbook()
+        ws = wb.active
+        row = next((r for r in range(2, ws.max_row + 1)
+                    if ws.cell(r, 1).value == pid), None)
+        if row is None:
+            ws.append([pid, now, "", "", None, None, None, 0, now])
+            row = ws.max_row
+        for col_name, value in fields.items():
+            cell = ws.cell(row, HEADERS.index(col_name) + 1, value)
+            if col_name == "رقم الجوال":
+                cell.number_format = "@"  # يحفظ الصفر في بداية الرقم
+        ws.cell(row, HEADERS.index("آخر تحديث") + 1, now)
+        tmp = DATA_FILE.with_suffix(".tmp")
+        wb.save(tmp)
+        tmp.replace(DATA_FILE)
+
+
+def persist() -> None:
+    s = st.session_state
+    fields = {LEVEL_COL[n]: s.scores[n] for n in (1, 2, 3)}
+    fields["مجموع النقاط"] = total()
+    try:
+        save_player(s.pid, fields)
+    except Exception:  # لا نوقف اللعبة إذا فشل الحفظ
+        s.save_error = True
+
+
+# ============================== الحالة ==============================
+def init_state():
+    defaults = {
+        "stage": "login", "name": "", "phone": "", "pid": "",
+        "scores": {1: None, 2: None, 3: None},
+        "qi": 0, "qc": 0, "picked": None,
+        "train": [], "test": None, "save_error": False,
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
+
+
+def total() -> int:
+    return sum(v or 0 for v in st.session_state.scores.values())
+
+
+def go(stage: str):
+    st.session_state.stage = stage
+    st.rerun()
+
+
+def start_level(stage: str):
+    s = st.session_state
+    s.qi, s.qc, s.picked, s.train, s.test = 0, 0, None, [], None
+    go(stage)
+
 
 def knn_predict(train, point, k=1):
-    dists = sorted((math.dist((x, y), point), label) for x, y, label in train)
+    dists = sorted((math.dist((x, y), point), lbl) for x, y, lbl in train)
     top = [lbl for _, lbl in dists[:k]]
     return max(set(top), key=top.count)
 
-# ------------------------- إدارة جلسة اللعبة -------------------------
-if "step" not in st.session_state:
-    st.session_state.step = "register"
-    st.session_state.name = ""
-    st.session_state.phone = ""
-    st.session_state.score = 0
-    st.session_state.train_data = []
 
-# 1. شاشة التسجيل
-if st.session_state.step == "register":
-    st.title("🤖 رحلة الذكاء الاصطناعي")
-    st.markdown("أهلاً بكِ في رحلتنا الممتعة! الرجاء إدخال بياناتكِ للبدء:")
-    
-    with st.form("reg_form"):
-        name = st.text_input("اسم الطالبة الثلاثي:")
-        phone = st.text_input("رقم الجوال (للتواصل أو حفظ النتيجة):")
-        submitted = st.form_submit_button("ابدأ الرحلة 🚀")
-        
-        if submitted:
-            if name.strip() and phone.strip():
-                st.session_state.name = name
-                st.session_state.phone = phone
-                st.session_state.step = "home"
-                st.rerun()
-            else:
-                st.error("الرجاء إدخال الاسم ورقم الجوال بشكل صحيح.")
+# ============================== الشاشات ==============================
+def header_bar():
+    c1, c2 = st.columns([1, 5])
+    if LOGO.exists():
+        c1.image(str(LOGO), width=70)
+    c2.markdown(f"**أكاديمية نمو | Numo Academy**  \n👩‍🎓 {st.session_state.name}")
+    st.divider()
 
-# 2. القائمة الرئيسية
-elif st.session_state.step == "home":
-    st.title(f"مرحباً بكِ، {st.session_state.name} 🌟")
-    st.success(f"مجموع نقاطكِ الحالي: {st.session_state.score}")
-    
-    st.markdown("---")
-    choice = st.radio("اختاري المستوى:", [
-        "المستوى 1: ما هو الذكاء الاصطناعي؟",
-        "المستوى 2: درّبي الآلة 🍎🍌",
-        "المستوى 3: اكتشفي التحيّز ⚖️",
-        "إنهاء وحفظ النتيجة 🏁"
-    ])
-    
-    if st.button("انتقلي للمستوى المختار"):
-        if "المستوى 1" in choice:
-            st.session_state.step = "level1"
-            st.session_state.q_idx = 0
-            st.session_state.correct_count = 0
-        elif "المستوى 2" in choice:
-            st.session_state.step = "level2"
-        elif "المستوى 3" in choice:
-            st.session_state.step = "level3"
-            st.session_state.q_idx = 0
-            st.session_state.correct_count = 0
-        elif "إنهاء" in choice:
-            save_player_data(st.session_state.name, st.session_state.phone, st.session_state.score)
-            st.session_state.step = "finished"
-        st.rerun()
 
-# 3. المستوى الأول والثالث (نظام الأسئلة)
-elif st.session_state.step in ["level1", "level3"]:
-    lvl_title = "المستوى 1: ما هو الذكاء الاصطناعي؟" if st.session_state.step == "level1" else "المستوى 3: اكتشفي التحيّز ⚖️"
-    questions = LEVEL1 if st.session_state.step == "level1" else LEVEL3
-    
-    st.subheader(lvl_title)
-    idx = st.session_state.q_idx
-    
-    if idx < len(questions):
-        q, options, ans, explain = questions[idx]
-        st.write(f"**سؤال {idx + 1} من {len(questions)}:**")
-        st.markdown(f"### {q}")
-        
-        user_choice = st.radio("اختاري الإجابة المناسبة:", options, key=f"q_{idx}")
-        
-        if st.button("تأكيد الإجابة"):
-            selected_idx = options.index(user_choice)
-            if selected_idx == ans:
-                st.success("✅ إجابة صحيحة! " + explain)
-                st.session_state.score += 10
-                st.session_state.correct_count += 1
-            else:
-                st.error("❌ إجابة خاطئة. " + explain)
-            
-            if st.button("السؤال التالي ◀"):
-                st.session_state.q_idx += 1
-                st.rerun()
+def screen_login():
+    if LOGO.exists():
+        _, mid, _ = st.columns([1, 1, 1])
+        mid.image(str(LOGO), use_container_width=True)
+    st.markdown("<h2 style='text-align:center'>مرحبًا بكِ في رحلة الذكاء الاصطناعي 🤖</h2>",
+                unsafe_allow_html=True)
+    with st.form("login"):
+        name = st.text_input("اسم الطالبة")
+        phone = st.text_input("رقم الجوال (مثال: 0500000000)", max_chars=10)
+        consent = st.checkbox("أوافق على حفظ اسمي ورقم جوالي لدى أكاديمية نمو "
+                              "لأغراض المتابعة والتواصل.")
+        submitted = st.form_submit_button("ابدئي الرحلة ◀", type="primary")
+
+    if not submitted:
+        return
+    name = " ".join(name.split())
+    phone = phone.strip().translate(AR_DIGITS)
+    if len(name) < 2 or not all(ch.isalpha() or ch == " " for ch in name):
+        st.error("⚠️ فضلًا اكتبي اسمك بالحروف فقط (حرفان على الأقل).")
+    elif not re.fullmatch(r"05\d{8}", phone):
+        st.error("⚠️ رقم الجوال يجب أن يكون بالصيغة 0500000000 (10 أرقام تبدأ بـ 05).")
+    elif not consent:
+        st.error("⚠️ فضلًا وافقي على حفظ البيانات للمتابعة.")
     else:
+        s = st.session_state
+        s.name, s.phone, s.pid = name, phone, uuid.uuid4().hex[:10]
+        try:
+            save_player(s.pid, {"الاسم": name, "رقم الجوال": phone})
+        except Exception:
+            s.save_error = True
+        go("home")
+
+
+def screen_home():
+    s = st.session_state
+    st.markdown(f"### أهلًا بكِ يا {s.name} 👋")
+    st.metric("مجموع نقاطك", total())
+    st.write("ثلاثة مستويات لتتعلّمي أساسيات الذكاء الاصطناعي بالمرح!")
+    for n, title, stage in LEVELS:
+        done = s.scores[n] is not None
+        if st.button(("✅ " if done else "") + title, key=f"lvl{n}"):
+            start_level(stage)
+    if all(v is not None for v in s.scores.values()):
         st.balloons()
-        st.success(f"🎉 أنهيتِ المستوى بنجاح! أجبتِ بشكل صحيح على {st.session_state.correct_count} من {len(questions)}")
-        if st.button("العودة للقائمة الرئيسية"):
-            st.session_state.step = "home"
+        st.success(f"🏆 أنهيتِ كل المستويات يا {s.name}! مجموع نقاطك {total()}.")
+    st.divider()
+    if st.button("🚪 إنهاء الجلسة"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+    if s.save_error:
+        st.warning("تعذّر حفظ النتيجة في الملف، أبلغي المشرفة.")
+
+
+def screen_quiz(n: int):
+    s = st.session_state
+    qs = LEVEL1 if n == 1 else LEVEL3
+    if s.qi >= len(qs):
+        st.markdown(f"## 🎉 أحسنتِ يا {s.name}!")
+        st.write(f"إجاباتك الصحيحة: **{s.qc} من {len(qs)}**  |  نقاط المستوى: **{s.scores[n]}**")
+        if st.button("العودة للقائمة", type="primary"):
+            go("home")
+        return
+
+    q, options, ans, explain = qs[s.qi]
+    st.caption(f"المستوى {n} — سؤال {s.qi + 1} من {len(qs)}")
+    st.markdown(f"#### {q}")
+    for j, opt in enumerate(options):
+        if st.button(opt, key=f"q{n}_{s.qi}_{j}", disabled=s.picked is not None):
+            s.picked = j
+            if j == ans:
+                s.qc += 1
             st.rerun()
 
-# 4. المستوى الثاني (تدريب الآلة)
-elif st.session_state.step == "level2":
-    st.subheader("🍎🍌 المستوى 2: درّبي الآلة على التفريق بين التفاحة والموزة")
-    st.write("حرّكي المنزلقين لوصف الفاكهة (الطول والاستدارة) ثم أضيفي أمثلة للآلة لتتعلم منها.")
-    
-    length = st.slider("الطول (قصير ← طويل)", 0.0, 10.0, 5.0, 0.5)
-    roundness = st.slider("الاستدارة (مستقيم ← مستدير)", 0.0, 10.0, 5.0, 0.5)
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if st.button("أضيفها كتفاحة 🍎"):
-            st.session_state.train_data.append((length, roundness, "تفاحة"))
-            st.success("تمت إضافة تفاحة بنجاح!")
-    with col2:
-        if st.button("أضيفها كموزة 🍌"):
-            st.session_state.train_data.append((length, roundness, "موزة"))
-            st.success("تمت إضافة موزة بنجاح!")
-    with col3:
-        if st.button("مسح الأمثلة"):
-            st.session_state.train_data = []
-            st.info("تم مسح جميع الأمثلة.")
-            
-    st.write(f"عدد أمثلة التدريب الحالية: **{len(st.session_state.train_data)}**")
-    
-    if st.button("اختبري الآلة ✅"):
-        labels_set = {lbl for _, _, lbl in st.session_state.train_data}
-        if len(labels_set) < 2 or len(st.session_state.train_data) < 4:
-            st.error("⚠️ أضيفي 4 أمثلة على الأقل، ومن النوعين معًا (تفاحة وموزة).")
-        else:
-            preds = [((x, y, t), knn_predict(st.session_state.train_data, (x, y))) for x, y, t in TEST_SET]
-            right = sum(1 for (_, _, t), p in preds if t == p)
-            st.write(f"**دقة الآلة:** {right} من {len(TEST_SET)}")
-            if right == len(TEST_SET):
-                st.balloons()
-                st.success("🏆 ممتاز! الآلة تعلّمت من أمثلتك بدقة كاملة.")
-                st.session_state.score += 30
-            else:
-                st.warning("جربي إضافة أمثلة أكثر وأكثر تنوعاً قرب الحدود بين النوعين.")
-                
-    if st.button("العودة للقائمة الرئيسية"):
-        st.session_state.step = "home"
-        st.rerun()
+    if s.picked is not None:
+        (st.success if s.picked == ans else st.error)(
+            ("✅ إجابة صحيحة! " if s.picked == ans else "❌ ليست صحيحة. ") + explain)
+        last = s.qi == len(qs) - 1
+        if st.button("إنهاء المستوى ✔" if last else "التالي ◀", type="primary",
+                     key=f"next{n}_{s.qi}"):
+            s.qi += 1
+            s.picked = None
+            if s.qi >= len(qs):
+                new = s.qc * 10
+                s.scores[n] = max(s.scores[n] or 0, new)  # نحتفظ بأفضل نتيجة
+                persist()
+            st.rerun()
+    if st.button("◀ القائمة", key=f"back{n}"):
+        go("home")
 
-# 5. شاشة النهاية
-elif st.session_state.step == "finished":
-    st.title("🏆 شكراً لكِ لمشاركتكِ!")
-    st.markdown(f"**الاسم:** {st.session_state.name}")
-    st.markdown(f"**رقم الجوال:** {st.session_state.phone}")
-    st.markdown(f"**النقاط النهائية:** {st.session_state.score} نقطة 🌟")
-    st.success("تم حفظ نتيجتكِ وبياناتكِ بنجاح في قاعدة البيانات.")
-    
-    if st.button("العب مرة أخرى"):
-        st.session_state.step = "register"
-        st.session_state.score = 0
-        st.session_state.train_data = []
-        st.rerun()
+
+def draw_chart():
+    s = st.session_state
+    if not s.train:
+        st.info("أضيفي أمثلة لتظهر هنا على الرسم.")
+        return
+    color = alt.Color("النوع:N", legend=alt.Legend(title=None),
+                      scale=alt.Scale(domain=["تفاحة", "موزة"], range=FRUIT_COLORS))
+    x = alt.X("الطول:Q", scale=alt.Scale(domain=[0, 10]))
+    y = alt.Y("الاستدارة:Q", scale=alt.Scale(domain=[0, 10]))
+    df = pd.DataFrame(s.train, columns=["الطول", "الاستدارة", "النوع"])
+    chart = alt.Chart(df).mark_circle(size=230, opacity=0.9, stroke="black",
+                                      strokeWidth=1).encode(x=x, y=y, color=color)
+    if s.test and "preds" in s.test:
+        tdf = pd.DataFrame(s.test["preds"],
+                           columns=["الطول", "الاستدارة", "النوع", "الحقيقي", "النتيجة"])
+        squares = alt.Chart(tdf).mark_square(size=300, strokeWidth=4).encode(
+            x=x, y=y, color=color,
+            stroke=alt.Stroke("النتيجة:N", legend=alt.Legend(title="اختبار الآلة"),
+                              scale=alt.Scale(domain=["صحيح", "خطأ"],
+                                              range=["#2e9e5b", "#000000"])),
+            tooltip=["الطول", "الاستدارة", "النوع", "الحقيقي", "النتيجة"])
+        chart = chart + squares
+    st.altair_chart(chart.properties(height=320), use_container_width=True)
+
+
+def screen_train():
+    s = st.session_state
+    st.markdown("#### 🍎🍌 درّبي الآلة على التفريق بين التفاحة والموزة")
+    st.write("حرّكي المنزلقين لوصف الفاكهة ثم اختاري اسمها. كلما أعطيتِ الآلة أمثلة أكثر "
+             "وأكثر تنوّعًا، تعلّمت أفضل!")
+    c1, c2 = st.columns(2)
+    length = c1.slider("الطول (قصير ← طويل)", 0.0, 10.0, 5.0, 0.5)
+    roundness = c2.slider("الاستدارة (مستقيم ← مستدير)", 0.0, 10.0, 5.0, 0.5)
+
+    b1, b2, b3, b4 = st.columns(4)
+    if b1.button("تفاحة 🍎"):
+        s.train.append((length, roundness, "تفاحة"))
+        s.test = None
+    if b2.button("موزة 🍌"):
+        s.train.append((length, roundness, "موزة"))
+        s.test = None
+    if b3.button("🗑️ مسح"):
+        s.train, s.test = [], None
+    if b4.button("اختبري ✅", type="primary"):
+        labels = {lbl for *_, lbl in s.train}
+        if len(labels) < 2 or len(s.train) < 4:
+            s.test = {"error": "⚠️ أضيفي 4 أمثلة على الأقل، ومن النوعين معًا (تفاحة وموزة)."}
+        else:
+            preds = []
+            for x, y, true in TEST_SET:
+                p = knn_predict(s.train, (x, y))
+                preds.append((x, y, p, true, "صحيح" if p == true else "خطأ"))
+            right = sum(1 for *_, ok in preds if ok == "صحيح")
+            s.test = {"preds": preds, "right": right,
+                      "counts": {l: sum(1 for *_, t in s.train if t == l) for l in labels}}
+            s.scores[2] = max(s.scores[2] or 0, right * 5)  # حتى 30 نقطة
+            persist()
+
+    draw_chart()
+    st.caption(f"أمثلة التدريب: {len(s.train)}")
+
+    t = s.test
+    if t:
+        if "error" in t:
+            st.error(t["error"])
+        else:
+            n = len(TEST_SET)
+            msg = (f"دقة الآلة: **{t['right']} من {n}** "
+                   "(المربعات = اختبار جديد، الإطار الأخضر = تنبؤ صحيح)")
+            if t["right"] == n:
+                st.success("🏆 ممتاز! الآلة تعلّمت من أمثلتك. " + msg)
+            else:
+                st.warning(msg + "  \nجرّبي إضافة أمثلة أكثر وأكثر تنوّعًا قرب الحدود بين النوعين.")
+            c = t["counts"]
+            if max(c.values()) >= 3 * min(c.values()):
+                st.info("⚖️ لاحظي: أمثلتك غير متوازنة بين النوعين، وهذا قد يسبّب تحيّزًا في النموذج!")
+    if st.button("◀ القائمة", key="back2"):
+        go("home")
+
+
+# ============================== لوحة المشرف ==============================
+def admin_password():
+    try:
+        if "ADMIN_PASSWORD" in st.secrets:
+            return str(st.secrets["ADMIN_PASSWORD"])
+    except Exception:
+        pass
+    return os.environ.get("ADMIN_PASSWORD")
+
+
+def admin_panel():
+    pw = admin_password()
+    if not pw:
+        return
+    with st.sidebar.expander("🔒 لوحة المشرفة"):
+        entered = st.text_input("كلمة المرور", type="password", key="admin_pw")
+        if not entered:
+            return
+        if not hmac.compare_digest(entered.encode(), pw.encode()):
+            st.error("كلمة المرور غير صحيحة.")
+            return
+        if not DATA_FILE.exists():
+            st.info("لا توجد بيانات بعد.")
+            return
+        with file_lock():
+            data = DATA_FILE.read_bytes()
+        st.download_button("⬇️ تنزيل ملف اللاعبات (Excel)", data, file_name="players.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.dataframe(pd.read_excel(DATA_FILE, dtype={"رقم الجوال": str}),
+                     use_container_width=True)
+
+
+# ============================== التشغيل ==============================
+def main():
+    init_state()
+    admin_panel()
+    stage = st.session_state.stage
+    if stage != "login":
+        header_bar()
+    if stage == "login":
+        screen_login()
+    elif stage == "home":
+        screen_home()
+    elif stage == "quiz1":
+        screen_quiz(1)
+    elif stage == "quiz3":
+        screen_quiz(3)
+    elif stage == "train":
+        screen_train()
+
+
+main()
